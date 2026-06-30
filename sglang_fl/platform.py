@@ -14,6 +14,7 @@ Environment variables:
   FLAGCX_PATH=<path>                         If set, default to flagcx backend
 """
 
+import importlib
 import logging
 import os
 from typing import Optional
@@ -34,6 +35,14 @@ _DIST_BACKEND_MAP = {
     "cambricon": "cncl",
     "mthreads": "mccl",
     "thead": "nccl",
+}
+
+# Attention backend mapping: vendor_name -> default backend
+# The value must match a name registered in sglang.srt.layers.attention.attention_registry. 
+_ATTN_BACKEND_MAP = {
+    "nvidia": "flashinfer",
+    "ascend": "ascend",
+    "mthreads": "fa3",
 }
 
 
@@ -194,15 +203,11 @@ class PlatformFL(SRTPlatform):
     # ------------------------------------------------------------------
 
     def get_default_attention_backend(self) -> str:
-        """Return attention backend name.
+        """Return attention backend name from the per-vendor map.
 
-        CUDA with FlashAttention available -> "flashinfer" (SGLang default)
-        Non-CUDA -> "torch_native" (PyTorch SDPA, registered in attention registry)
+        Falls back to "torch_native" (PyTorch SDPA) for vendors not in the map.
         """
-        if self._device_type == "cuda":
-            return "flashinfer"
-        # Non-CUDA: torch_native uses F.scaled_dot_product_attention
-        return "torch_native"
+        return _ATTN_BACKEND_MAP.get(self._vendor_name, "torch_native")
 
     def get_graph_runner_cls(self) -> type:
         """Return graph runner class for this platform."""
@@ -292,11 +297,26 @@ class PlatformFL(SRTPlatform):
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
-        """One-time backend initialization in each worker."""
+        """One-time backend initialization in each worker.
+
+        Auto-imports ``vendor/<vendor_name>/register_platform.py`` if present —
+        that module is where vendor-specific ``@register_attention_backend``
+        decorators live, which inject OOT backends into sglang's
+        ``ATTENTION_BACKENDS`` dict. See ``vendor/template/`` for a skeleton.
+        """
+        vendor_module = (
+            f"sglang_fl.dispatch.backends.vendor.{self._vendor_name}.register_platform"
+        )
+        try:
+            importlib.import_module(vendor_module)
+            status = "loaded"
+        except ImportError:
+            status = "absent"
         logger.info(
-            "PlatformFL init_backend: vendor=%s, device=%s",
+            "PlatformFL init_backend: vendor=%s, device=%s, vendor_module=%s",
             self._vendor_name,
             self._device_type,
+            status,
         )
 
     # ------------------------------------------------------------------
@@ -316,11 +336,15 @@ class PlatformFL(SRTPlatform):
     # ------------------------------------------------------------------
 
     def apply_server_args_defaults(self, server_args) -> None:
-        """Apply platform-specific defaults to server arguments."""
-        # Non-CUDA platforms may need attention backend override
-        if self._device_type != "cuda":
-            if (
-                not hasattr(server_args, "attention_backend")
-                or server_args.attention_backend is None
-            ):
-                server_args.attention_backend = "torch_native"
+        """Apply platform-specific defaults to server arguments.
+
+        CUDA is skipped — sglang's own defaulting handles it. For other vendors,
+        if the user didn't pick an attention backend, fill from _ATTN_BACKEND_MAP.
+        """
+        if self._device_type == "cuda":
+            return
+        if (
+            not hasattr(server_args, "attention_backend")
+            or server_args.attention_backend is None
+        ):
+            server_args.attention_backend = self.get_default_attention_backend()

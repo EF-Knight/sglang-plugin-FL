@@ -417,6 +417,40 @@ def _setup_flaggems(config: dict = None):
                 h.addFilter(_AtenOnlyFilter())
 
 
+# ─── Vendor-specific sglang patches ───────────────────────────────────────────
+
+
+def _apply_vendor_patches() -> None:
+    """Import vendor/<vendor_name>/patch.py to apply vendor monkey-patches
+    on sglang internals. Called last in load_plugin(), after every sglang_fl
+    layer (FlagGems ATen, dispatch system, AROUND hooks, communicator). 
+    Resolves vendor_name via FlagGems' DeviceDetector — no PlatformFL needed,
+    so this still runs before sglang's model_runner is imported. Silently 
+    skips when the vendor module is absent or hardware is unrecognised.
+    """
+    import importlib
+
+    try:
+        try:
+            # FlagGems<=5.0.2: DeviceDetector lives in device.
+            from flag_gems.runtime.backend.device import DeviceDetector
+        except ImportError:
+            # FlagGems>5.0.2: DeviceDetector lives in device_finder.
+            from flag_gems.runtime.backend.device_finder import DeviceDetector
+
+        vendor = DeviceDetector().vendor_name
+    except Exception as e:
+        logger.warning("vendor patch skipped: DeviceDetector failed (%s)", e)
+        return
+
+    module = f"sglang_fl.dispatch.backends.vendor.{vendor}.patch"
+    try:
+        importlib.import_module(module)
+        logger.info("vendor patch loaded: %s", module)
+    except ImportError:
+        logger.info("vendor patch absent: %s", module)
+
+
 # ─── Communicator AROUND hooks ────────────────────────────────────────────────
 
 
@@ -742,7 +776,10 @@ def load_plugin():
     # 4. Communicator hooks (CommunicatorFL with FlagCX/torch.distributed)
     _setup_communicator_hooks()
 
-    # 5. Summary banner — confirm plugin is active (rank 0 only)
+    # 5. Vendor-specific patches — final overlay on top of all sglang_fl layers
+    _apply_vendor_patches()
+
+    # 6. Summary banner — confirm plugin is active (rank 0 only)
     if _is_rank0():
         use_fg = _parse_bool(os.environ.get("USE_FLAGGEMS", "1"), default=True)
         aten_status = "OFF" if not use_fg else "ON"
